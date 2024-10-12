@@ -1,20 +1,20 @@
 package pgprometheus
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"github.com/jackc/pgx/v5"
 	"os"
-	"regexp"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/timescale/prometheus-postgresql-adapter/pkg/log"
-	"github.com/timescale/prometheus-postgresql-adapter/pkg/util"
 
-	_ "github.com/lib/pq"
+	pgx_stdlib "github.com/jackc/pgx/v5/stdlib"
 	"github.com/prometheus/common/model"
 )
 
@@ -58,40 +58,45 @@ type Client struct {
 
 // noinspection SqlNoDataSourceInspection
 const (
-	sqlCreateTmpTable = "CREATE TEMPORARY TABLE IF NOT EXISTS %s_tmp(sample prom_sample) ON COMMIT DELETE ROWS;"
-	sqlCopyTable      = "COPY \"%s\" FROM STDIN"
-	sqlInsertLabels   = "insert into %s_labels (metric_name, labels) select distinct sample.metric_name, sample.labels from %s_tmp sample on conflict do nothing;"
-	sqlInsertValues   = "insert into %s_values (time, value, labels_id) select sample.time, sample.value, lbl.id from %s_tmp sample left join %s_labels lbl on lbl.metric_name = sample.metric_name and lbl.labels = sample.labels;"
-	sqlHealthCheck    = "SELECT 1"
+	sqlCreateTmpTable   = "create temporary table %s_tmp (time timestamp with time zone, value double precision, metric_name text, labels jsonb) on commit preserve rows;"
+	sqlTempTableCleanup = "drop table %s_tmp;"
+	sqlInsertLabels     = "insert into %s_labels (metric_name, labels) select distinct sample.metric_name, sample.labels from %s_tmp sample on conflict do nothing;"
+	sqlInsertValues     = "insert into %s_values (time, value, labels_id) select sample.time, sample.value, lbl.id from %s_tmp sample left join %s_labels lbl on lbl.metric_name = sample.metric_name and lbl.labels = sample.labels;"
+	sqlHealthCheck      = "SELECT 1"
 )
 
-var (
-	createTmpTableStmt *sql.Stmt
-)
-
-// NewClient creates a new PostgreSQL client
-func NewClient(cfg *Config) *Client {
+func readPassword(cfg *Config) string {
 	content, err := os.ReadFile(cfg.passwordFile)
 	if err != nil {
 		log.Error("msg", "Password file for establishing postgresql connection not found", "err", err)
 		os.Exit(1)
 	}
-	password := string(content)
-	connStr := fmt.Sprintf("host=%v port=%v user=%v dbname=%v password='%v' sslmode=%v connect_timeout=10",
-		cfg.host, cfg.port, cfg.user, cfg.database, password, cfg.sslMode)
+	return string(content)
+}
 
-	wrappedDb, err := util.RetryWithFixedDelay(uint(cfg.dbConnectRetries), time.Second, func() (interface{}, error) {
-		return sql.Open("postgres", connStr)
-	})
+// NewClient creates a new PostgreSQL client
+func NewClient(cfg *Config) *Client {
+	baseConnStr := fmt.Sprintf("host=%v port=%v user=%v dbname=%v sslmode=%v connect_timeout=10",
+		cfg.host, cfg.port, cfg.user, cfg.database, cfg.sslMode)
 
-	log.Info("msg", regexp.MustCompile("password='(.+?)'").ReplaceAllLiteralString(connStr, "password='****'"))
-
+	config, err := pgx.ParseConfig(baseConnStr)
 	if err != nil {
 		log.Error("err", err)
 		os.Exit(1)
 	}
+	beforeConnectHook := func(ctx context.Context, connConfig *pgx.ConnConfig) error {
+		if connConfig != nil {
+			log.Debug("msg", "Re-reading password before establishing new connection...")
+			password := readPassword(cfg)
+			connConfig.Password = password
+		}
+		return nil
+	}
+	connector := pgx_stdlib.GetConnector(*config, pgx_stdlib.OptionBeforeConnect(beforeConnectHook))
 
-	db := wrappedDb.(*sql.DB)
+	db := sql.OpenDB(connector)
+
+	log.Info("msg", baseConnStr)
 
 	db.SetMaxOpenConns(cfg.maxOpenConns)
 	db.SetMaxIdleConns(cfg.maxIdleConns)
@@ -99,12 +104,6 @@ func NewClient(cfg *Config) *Client {
 	client := &Client{
 		DB:  db,
 		cfg: cfg,
-	}
-
-	createTmpTableStmt, err = db.Prepare(fmt.Sprintf(sqlCreateTmpTable, cfg.table))
-	if err != nil {
-		log.Error("msg", "Error on preparing create tmp table statement", "err", err)
-		os.Exit(1)
 	}
 
 	return client
@@ -145,104 +144,109 @@ func metricMetaJson(m model.Metric) (string, string) {
 	}
 }
 
-// Write implements the Writer interface and writes metric samples to the database
-func (c *Client) Write(samples model.Samples) error {
-	begin := time.Now()
-	tx, err := c.DB.Begin()
+func copyFromTmpTableInTransaction(ctx context.Context, conn *sql.Conn, query string, queryDescription string) error {
+	tx, err := conn.BeginTx(ctx, nil)
 
 	if err != nil {
-		log.Error("msg", "Error on Begin when writing samples", "err", err)
+		log.Error("msg", "Error on transaction setup", "err", err, "desc", queryDescription)
 		return err
 	}
 
 	defer func(tx *sql.Tx) {
-		err = tx.Rollback()
-		if err != nil {
-			log.Warn("msg", "Rollback failed", "err", err)
-		}
+		_ = tx.Rollback()
 	}(tx)
 
-	_, err = tx.Stmt(createTmpTableStmt).Exec()
+	stmtLabels, err := tx.Prepare(query)
+	if err != nil {
+		log.Error("msg", "Error on preparing statement", "err", err, "desc", queryDescription)
+		return err
+	}
+	_, err = stmtLabels.Exec()
+	if err != nil {
+		log.Error("msg", "Error executing statement", "err", err, "desc", queryDescription)
+		return err
+	}
+
+	err = stmtLabels.Close()
+	if err != nil {
+		log.Error("msg", "Error on closing statement", "err", err, "desc", queryDescription)
+		return err
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		log.Error("msg", "Error on Commit", "err", err, "desc", queryDescription)
+		return err
+	}
+	return nil
+}
+
+func (c *Client) insertLabels(ctx context.Context, conn *sql.Conn) error {
+	query := fmt.Sprintf(sqlInsertLabels, c.cfg.table, c.cfg.table)
+	return copyFromTmpTableInTransaction(ctx, conn, query, "labels")
+}
+
+func (c *Client) insertValues(ctx context.Context, conn *sql.Conn) error {
+	query := fmt.Sprintf(sqlInsertValues, c.cfg.table, c.cfg.table, c.cfg.table)
+	return copyFromTmpTableInTransaction(ctx, conn, query, "values")
+}
+
+func (c *Client) cleanup(ctx context.Context, conn *sql.Conn) {
+	// not 100% sure if this is necessary, but AFAICT there's no reason why returning
+	// a connection to the pool would clean session-local data like temporary tables
+	_, err := conn.ExecContext(ctx, fmt.Sprintf(sqlTempTableCleanup, c.cfg.table))
+	if err != nil {
+		log.Error("msg", "Failed to clean up temp table", "err", err)
+	}
+	_ = conn.Close()
+}
+
+// Write implements the Writer interface and writes metric samples to the database
+func (c *Client) Write(samples model.Samples) error {
+	begin := time.Now()
+	ctx := context.Background()
+	conn, err := c.DB.Conn(ctx)
+	if err != nil {
+		log.Error("msg", "Failed to acquire database connection", "err", err)
+		return err
+	}
+	defer c.cleanup(ctx, conn)
+
+	_, err = conn.ExecContext(ctx, fmt.Sprintf(sqlCreateTmpTable, c.cfg.table))
 	if err != nil {
 		log.Error("msg", "Error executing create tmp table", "err", err)
 		return err
 	}
 
 	copyTable := fmt.Sprintf("%s_tmp", c.cfg.table)
-	copyStmt, err := tx.Prepare(fmt.Sprintf(sqlCopyTable, copyTable))
-
-	if err != nil {
-		log.Error("msg", "Error on COPY prepare", "err", err)
-		return err
-	}
+	var inputRows [][]interface{} = nil
 
 	for _, sample := range samples {
-		timestampStr := sample.Timestamp.Time().UTC().Format(time.RFC3339)
+		timestamp := sample.Timestamp.Time().UTC()
 		metricName, metricJson := metricMetaJson(sample.Metric)
-		line := fmt.Sprintf("%v\t%v\t%v\t%v", timestampStr, sample.Value, metricName, metricJson)
+		line := fmt.Sprintf("%v\t%v\t%v\t%v", timestamp.Format(time.RFC3339), sample.Value, metricName, metricJson)
 		if c.cfg.pgPrometheusLogSamples {
 			fmt.Println(line)
 		}
-
-		_, err = copyStmt.Exec(line)
-		if err != nil {
-			log.Error("msg", "Error executing COPY statement", "stmt", line, "err", err)
-			return err
-		}
+		inputRows = append(inputRows, []interface{}{timestamp, float64(sample.Value), metricName, metricJson})
 	}
-
-	_, err = copyStmt.Exec()
+	err = conn.Raw(func(driverConn any) error {
+		conn := driverConn.(*pgx_stdlib.Conn).Conn()
+		_, err := conn.CopyFrom(ctx, []string{copyTable}, []string{"time", "value", "metric_name", "labels"}, pgx.CopyFromRows(inputRows))
+		return err
+	})
 	if err != nil {
-		log.Error("msg", "Error executing COPY statement", "err", err)
+		log.Error("msg", "Error on copy", "err", err)
 		return err
 	}
 
-	if copyTable == fmt.Sprintf("%s_tmp", c.cfg.table) {
-		stmtLabels, err := tx.Prepare(fmt.Sprintf(sqlInsertLabels, c.cfg.table, c.cfg.table))
-		if err != nil {
-			log.Error("msg", "Error on preparing labels statement", "err", err)
-			return err
-		}
-		_, err = stmtLabels.Exec()
-		if err != nil {
-			log.Error("msg", "Error executing labels statement", "err", err)
-			return err
-		}
-
-		stmtValues, err := tx.Prepare(fmt.Sprintf(sqlInsertValues, c.cfg.table, c.cfg.table, c.cfg.table))
-		if err != nil {
-			log.Error("msg", "Error on preparing values statement", "err", err)
-			return err
-		}
-		_, err = stmtValues.Exec()
-		if err != nil {
-			log.Error("msg", "Error executing values statement", "err", err)
-			return err
-		}
-
-		err = stmtLabels.Close()
-		if err != nil {
-			log.Error("msg", "Error on closing labels statement", "err", err)
-			return err
-		}
-
-		err = stmtValues.Close()
-		if err != nil {
-			log.Error("msg", "Error on closing values statement", "err", err)
-			return err
-		}
-	}
-
-	err = copyStmt.Close()
+	err = c.insertLabels(ctx, conn)
 	if err != nil {
-		log.Error("msg", "Error on COPY Close when writing samples", "err", err)
 		return err
 	}
 
-	err = tx.Commit()
-
+	err = c.insertValues(ctx, conn)
 	if err != nil {
-		log.Error("msg", "Error on Commit when writing samples", "err", err)
 		return err
 	}
 
