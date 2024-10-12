@@ -8,7 +8,7 @@ import (
 	"github.com/timescale/prometheus-postgresql-adapter/pkg/log"
 )
 
-//ThroughputCalc runs on scheduled interval to calculate the throughput per second and sends results to a channel
+// ThroughputCalc runs on scheduled interval to calculate the throughput per second and sends results to a channel
 type ThroughputCalc struct {
 	tickInterval time.Duration
 	previous     float64
@@ -52,7 +52,7 @@ func (dt *ThroughputCalc) Start() {
 	}
 }
 
-// Blocking retry with a fixed delay
+// RetryWithFixedDelay Blocking retry with a fixed delay
 func RetryWithFixedDelay(retries uint, wait time.Duration, f func() (interface{}, error)) (interface{}, error) {
 	current := uint(0)
 	for {

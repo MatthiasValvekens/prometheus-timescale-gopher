@@ -19,7 +19,7 @@ package main
 
 import (
 	"flag"
-	"io/ioutil"
+	"io"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
@@ -36,7 +36,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	io_prometheus_client "github.com/prometheus/client_model/go"
+	ioprometheusclient "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/prompb"
 
@@ -119,17 +119,11 @@ func main() {
 
 	http.Handle(cfg.telemetryPath, promhttp.Handler())
 
-	writer, reader := buildClients(cfg)
-	pgClient, ok := writer.(*pgprometheus.Client)
-	if ok {
-		elector = initElector(cfg, pgClient.DB)
-	} else {
-		log.Info("msg", "Running in read-only mode. This instance can't participate in leader election")
-	}
+	pgClient := buildClients(cfg)
+	elector = initElector(cfg, pgClient.DB)
 
-	http.Handle("/write", timeHandler("write", write(writer)))
-	http.Handle("/read", timeHandler("read", read(reader)))
-	http.Handle("/healthz", health(reader))
+	http.Handle("/write", timeHandler("write", write(pgClient)))
+	http.Handle("/healthz", health(pgClient))
 
 	log.Info("msg", "Starting up...")
 	log.Info("msg", "Listening", "addr", cfg.listenAddr)
@@ -169,29 +163,9 @@ type writer interface {
 	Name() string
 }
 
-type noOpWriter struct{}
-
-func (no *noOpWriter) Write(samples model.Samples) error {
-	log.Debug("msg", "Noop writer", "num_samples", len(samples))
-	return nil
-}
-
-func (no *noOpWriter) Name() string {
-	return "noopWriter"
-}
-
-type reader interface {
-	Read(req *prompb.ReadRequest) (*prompb.ReadResponse, error)
-	Name() string
-	HealthCheck() error
-}
-
-func buildClients(cfg *config) (writer, reader) {
+func buildClients(cfg *config) *pgprometheus.Client {
 	pgClient := pgprometheus.NewClient(&cfg.pgPrometheusConfig)
-	if pgClient.ReadOnly() {
-		return &noOpWriter{}, pgClient
-	}
-	return pgClient, pgClient
+	return pgClient
 }
 
 func initElector(cfg *config, db *sql.DB) *util.Elector {
@@ -234,7 +208,7 @@ func initElector(cfg *config, db *sql.DB) *util.Elector {
 
 func write(writer writer) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		compressed, err := ioutil.ReadAll(r.Body)
+		compressed, err := io.ReadAll(r.Body)
 		if err != nil {
 			log.Error("msg", "Read error", "err", err.Error())
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -278,64 +252,16 @@ func write(writer writer) http.Handler {
 }
 
 func getCounterValue(counter prometheus.Counter) float64 {
-	dtoMetric := &io_prometheus_client.Metric{}
+	dtoMetric := &ioprometheusclient.Metric{}
 	if err := counter.Write(dtoMetric); err != nil {
 		log.Warn("msg", "Error reading counter value", "err", err, "sentSamples", sentSamples)
 	}
 	return dtoMetric.GetCounter().GetValue()
 }
 
-func read(reader reader) http.Handler {
+func health(writer *pgprometheus.Client) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		compressed, err := ioutil.ReadAll(r.Body)
-		if err != nil {
-			log.Error("msg", "Read error", "err", err.Error())
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		reqBuf, err := snappy.Decode(nil, compressed)
-		if err != nil {
-			log.Error("msg", "Decode error", "err", err.Error())
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-
-		var req prompb.ReadRequest
-		if err := proto.Unmarshal(reqBuf, &req); err != nil {
-			log.Error("msg", "Unmarshal error", "err", err.Error())
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-
-		var resp *prompb.ReadResponse
-		resp, err = reader.Read(&req)
-		if err != nil {
-			log.Warn("msg", "Error executing query", "query", req, "storage", reader.Name(), "err", err)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		data, err := proto.Marshal(resp)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/x-protobuf")
-		w.Header().Set("Content-Encoding", "snappy")
-
-		compressed = snappy.Encode(nil, data)
-		if _, err := w.Write(compressed); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-	})
-}
-
-func health(reader reader) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		err := reader.HealthCheck()
+		err := writer.HealthCheck()
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return

@@ -123,7 +123,9 @@ func (l *PgAdvisoryLock) getAdvisoryLock() (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	defer rows.Close()
+	defer func(rows *sql.Rows) {
+		_ = rows.Close()
+	}(rows)
 	if !rows.Next() {
 		err = rows.Err()
 		if err != nil {
@@ -161,11 +163,13 @@ func (l *PgAdvisoryLock) Release() error {
 		return fmt.Errorf("can't release while not holding the lock")
 	}
 	defer l.mutex.Unlock()
-	rows, err := l.conn.QueryContext(context.Background(), "SELECT pg_advisory_unlock_all()")
+	rows, err := l.conn.QueryContext(
+		context.Background(),
+		"SELECT pg_advisory_unlock_all()")
 	if err != nil {
 		return err
 	}
-	rows.Close()
+	_ = rows.Close()
 	l.connCleanUp()
 	l.obtained = false
 	return nil

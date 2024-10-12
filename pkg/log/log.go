@@ -13,28 +13,28 @@ var (
 
 func Init(logLevel string) {
 	allowedLevel := promlog.AllowedLevel{}
-	allowedLevel.Set(logLevel)
+	_ = allowedLevel.Set(logLevel)
 
-    config := promlog.Config{
-        Level: &allowedLevel,
-        Format: &promlog.AllowedFormat{},
-    }
+	config := promlog.Config{
+		Level:  &allowedLevel,
+		Format: &promlog.AllowedFormat{},
+	}
 
 	logger = promlog.New(&config)
 }
 
 func Debug(keyvals ...interface{}) {
-	level.Debug(logger).Log(keyvals...)
+	_ = level.Debug(logger).Log(keyvals...)
 }
 
 func Info(keyvals ...interface{}) {
-	level.Info(logger).Log(keyvals...)
+	_ = level.Info(logger).Log(keyvals...)
 }
 
 func Warn(keyvals ...interface{}) {
-	level.Warn(logger).Log(keyvals...)
+	_ = level.Warn(logger).Log(keyvals...)
 }
 
 func Error(keyvals ...interface{}) {
-	level.Error(logger).Log(keyvals...)
+	_ = level.Error(logger).Log(keyvals...)
 }

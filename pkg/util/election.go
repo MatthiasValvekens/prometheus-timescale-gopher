@@ -2,7 +2,7 @@ package util
 
 import (
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"strconv"
 	"sync"
@@ -124,7 +124,7 @@ func (se *ScheduledElector) scheduledElection() {
 	}
 }
 
-func (se *ScheduledElector) Elect() (bool, error) {
+func (se *ScheduledElector) Elect() bool {
 	leader, err := se.IsLeader()
 	if err != nil {
 		log.Error("msg", "Leader check failed", "err", err)
@@ -134,7 +134,7 @@ func (se *ScheduledElector) Elect() (bool, error) {
 			log.Error("msg", "Failed while becoming a leader", "err", err)
 		}
 	}
-	return leader, err
+	return leader
 }
 
 // RestElection is a REST interface allowing to plug in any external leader election mechanism.
@@ -163,9 +163,9 @@ func (r *RestElection) handleLeader() http.HandlerFunc {
 				http.Error(response, err.Error(), http.StatusInternalServerError)
 				return
 			}
-			fmt.Fprintf(response, "%v", leader)
+			_, _ = fmt.Fprintf(response, "%v", leader)
 		case http.MethodPut:
-			body, err := ioutil.ReadAll(request.Body)
+			body, err := io.ReadAll(request.Body)
 			if err != nil {
 				log.Error("msg", "Error reading request body", "err", err)
 				http.Error(response, "Can't read body", http.StatusBadRequest)
@@ -186,7 +186,7 @@ func (r *RestElection) handleLeader() http.HandlerFunc {
 					http.Error(response, err.Error(), http.StatusInternalServerError)
 					return
 				}
-				fmt.Fprintf(response, "%v", true)
+				_, _ = fmt.Fprintf(response, "%v", true)
 			case 1:
 				// become a leader
 				leader, err := r.BecomeLeader()
@@ -195,7 +195,7 @@ func (r *RestElection) handleLeader() http.HandlerFunc {
 					http.Error(response, err.Error(), http.StatusInternalServerError)
 					return
 				}
-				fmt.Fprintf(response, "%v", leader)
+				_, _ = fmt.Fprintf(response, "%v", leader)
 			default:
 				log.Error("msg", "Wrong number in request body", "body", string(body), "err", err)
 				http.Error(response, "1 or 0 expected in request body", http.StatusBadRequest)

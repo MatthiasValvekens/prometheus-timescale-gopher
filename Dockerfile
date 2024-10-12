@@ -1,5 +1,5 @@
 # Build stage
-FROM golang:1.12.9-alpine AS builder
+FROM golang:1.22-alpine AS builder
 COPY ./pkg prometheus-adapter/pkg
 COPY ./cmd prometheus-adapter/cmd
 COPY ./go.mod prometheus-adapter/go.mod
